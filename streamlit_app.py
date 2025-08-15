@@ -49,6 +49,10 @@ class EnhancedWialonService:
         
     def login(self, token):
         """Login with token"""
+        if not token or token.strip() == "":
+            st.error("Please provide a valid Wialon API token")
+            return None
+            
         url = f"{self.base_url}/wialon/ajax.html"
         params = {
             'svc': 'token/login',
@@ -57,21 +61,50 @@ class EnhancedWialonService:
         
         try:
             response = requests.post(url, data=params, timeout=30)
+            response.raise_for_status()  # Raise an exception for bad HTTP status
             result = response.json()
             
             if 'error' in result:
-                st.error(f"Login failed: {result['error']}")
+                error_code = result['error']
+                error_messages = {
+                    1: "Invalid session",
+                    2: "Invalid service name",
+                    3: "Invalid result",
+                    4: "Invalid input",
+                    5: "Error performing request",
+                    6: "Unknown error",
+                    7: "Access denied",
+                    8: "Invalid user name or password",
+                    9: "Authorization server is unavailable",
+                    1001: "No messages for selected interval",
+                    1002: "Item with such unique property already exists",
+                    1003: "Only one request is allowed at the moment"
+                }
+                error_msg = error_messages.get(error_code, f"Unknown error code: {error_code}")
+                st.error(f"Login failed: {error_msg}")
                 return None
             
+            if 'eid' not in result:
+                st.error("Login failed: No session ID received")
+                return None
+                
             self.session_id = result['eid']
+            st.success(f"✅ Connected successfully! Session ID: {self.session_id[:8]}...")
             return result
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error: {str(e)}")
+            return None
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid response format: {str(e)}")
+            return None
         except Exception as e:
-            st.error(f"Connection error: {str(e)}")
+            st.error(f"Unexpected error: {str(e)}")
             return None
     
     def make_request(self, service, params={}):
         """Make API request"""
         if not self.session_id:
+            st.error("No active session. Please login first.")
             return None
             
         url = f"{self.base_url}/wialon/ajax.html"
@@ -83,17 +116,34 @@ class EnhancedWialonService:
         
         try:
             response = requests.post(url, data=data, timeout=30)
+            response.raise_for_status()  # Raise an exception for bad HTTP status
             result = response.json()
             
             if 'error' in result:
-                if result['error'] == 1:
+                error_code = result['error']
+                if error_code == 1:
                     st.warning("Session expired. Please reconnect.")
                     self.session_id = None
-                return None
+                    return None
+                elif error_code == 7:
+                    st.error("Access denied. Check your permissions.")
+                    return None
+                else:
+                    st.error(f"API error {error_code} in service '{service}': {result.get('error', 'Unknown error')}")
+                    return None
                 
             return result
+        except requests.exceptions.Timeout:
+            st.error(f"Request timeout for service '{service}'. Please try again.")
+            return None
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error in service '{service}': {str(e)}")
+            return None
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid response format from service '{service}': {str(e)}")
+            return None
         except Exception as e:
-            st.error(f"Request failed: {str(e)}")
+            st.error(f"Unexpected error in service '{service}': {str(e)}")
             return None
     
     def get_fleet_with_enhanced_activity(self):
@@ -119,9 +169,17 @@ class EnhancedWialonService:
         fleet_data = []
         
         for unit in units:
+            # Validate unit data
+            unit_id = unit.get('id')
+            unit_name = unit.get('nm', 'Unknown')
+            
+            # Skip units without valid ID or name
+            if not unit_id or not unit_name or unit_name.strip() == '':
+                continue
+                
             unit_info = {
-                'id': unit.get('id'),
-                'name': unit.get('nm', 'Unknown'),
+                'id': unit_id,
+                'name': unit_name.strip(),
                 'device_type': unit.get('hw', 'Unknown'),
                 'unique_id': unit.get('uid', ''),
                 'phone': unit.get('ph', ''),
@@ -142,11 +200,30 @@ class EnhancedWialonService:
             
             if last_msg:
                 try:
-                    last_time = datetime.fromtimestamp(last_msg.get('t', 0))
+                    # Validate timestamp
+                    timestamp = last_msg.get('t', 0)
+                    if timestamp <= 0:
+                        st.warning(f"Invalid timestamp for vehicle {unit_info['name']}")
+                        continue
+                        
+                    last_time = datetime.fromtimestamp(timestamp)
                     days_ago = (datetime.now() - last_time).days
+                    
+                    # Ensure days_ago is not negative
+                    days_ago = max(0, days_ago)
                     
                     last_pos = last_msg.get('pos', {})
                     last_params = last_msg.get('p', {})
+                    
+                    # Validate coordinates
+                    latitude = last_pos.get('y', 0)
+                    longitude = last_pos.get('x', 0)
+                    
+                    # Basic coordinate validation
+                    if latitude < -90 or latitude > 90:
+                        latitude = 0
+                    if longitude < -180 or longitude > 180:
+                        longitude = 0
                     
                     # Determine activity status
                     if days_ago <= 1:
@@ -163,28 +240,42 @@ class EnhancedWialonService:
                         'days_inactive': days_ago,
                         'activity_status': activity_status,
                         'current_data': {
-                            'latitude': last_pos.get('y', 0),
-                            'longitude': last_pos.get('x', 0),
-                            'speed': last_pos.get('s', 0),
+                            'latitude': latitude,
+                            'longitude': longitude,
+                            'speed': max(0, last_pos.get('s', 0)),  # Ensure non-negative speed
                             'course': last_pos.get('c', 0),
-                            'satellites': last_pos.get('sc', 0),
+                            'satellites': max(0, last_pos.get('sc', 0)),  # Ensure non-negative satellites
                             'engine_on': bool(last_params.get('engine_on', 0) or last_params.get('ignition', 0) or last_params.get('ign', 0)),
-                            'fuel_level': last_params.get('fuel_level', 0) or last_params.get('fuel_lvl', 0),
-                            'power_voltage': last_params.get('pwr_ext', 0) or last_params.get('power', 0),
-                            'gsm_signal': last_params.get('gsm_signal', 0) or last_params.get('gsm_level', 0),
+                            'fuel_level': max(0, min(100, last_params.get('fuel_level', 0) or last_params.get('fuel_lvl', 0))),  # 0-100%
+                            'power_voltage': max(0, last_params.get('pwr_ext', 0) or last_params.get('power', 0)),
+                            'gsm_signal': max(0, min(100, last_params.get('gsm_signal', 0) or last_params.get('gsm_level', 0))),  # 0-100%
                             'temperature': last_params.get('pcb_temp', 0) or last_params.get('temperature', 0),
-                            'odometer': last_params.get('mileage', 0) or last_params.get('odometer', 0),
-                            'engine_hours': last_params.get('engine_hours', 0) or last_params.get('eh', 0),
-                            'harsh_acceleration': last_params.get('harsh_acceleration', 0),
-                            'harsh_braking': last_params.get('harsh_braking', 0),
-                            'harsh_cornering': last_params.get('harsh_cornering', 0),
-                            'idling_time': last_params.get('idling_time', 0),
-                            'driver_id': last_params.get('avl_driver', '0'),
+                            'odometer': max(0, last_params.get('mileage', 0) or last_params.get('odometer', 0)),
+                            'engine_hours': max(0, last_params.get('engine_hours', 0) or last_params.get('eh', 0)),
+                            'harsh_acceleration': max(0, last_params.get('harsh_acceleration', 0)),
+                            'harsh_braking': max(0, last_params.get('harsh_braking', 0)),
+                            'harsh_cornering': max(0, last_params.get('harsh_cornering', 0)),
+                            'idling_time': max(0, last_params.get('idling_time', 0)),
+                            'driver_id': str(last_params.get('avl_driver', '0')),
                             'param_count': len(last_params)
                         }
                     })
                 except Exception as e:
                     st.warning(f"Error processing last message for {unit_info['name']}: {e}")
+                    # Set default values if processing fails
+                    unit_info.update({
+                        'last_message': None,
+                        'days_inactive': 999,
+                        'activity_status': '❓ Unknown',
+                        'current_data': {
+                            'latitude': 0, 'longitude': 0, 'speed': 0, 'course': 0,
+                            'satellites': 0, 'engine_on': False, 'fuel_level': 0,
+                            'power_voltage': 0, 'gsm_signal': 0, 'temperature': 0,
+                            'odometer': 0, 'engine_hours': 0, 'harsh_acceleration': 0,
+                            'harsh_braking': 0, 'harsh_cornering': 0, 'idling_time': 0,
+                            'driver_id': '0', 'param_count': 0
+                        }
+                    })
             
             fleet_data.append(unit_info)
         
@@ -232,6 +323,19 @@ class EnhancedWialonService:
             
         except Exception as e:
             return None
+    
+    def logout(self):
+        """Logout and close session"""
+        if self.session_id:
+            try:
+                result = self.make_request('core/logout')
+                self.session_id = None
+                return result
+            except Exception as e:
+                st.warning(f"Error during logout: {e}")
+                self.session_id = None
+                return None
+        return None
 
 def create_enhanced_metrics_from_real_data(vehicle_data, period_days=7):
     """Create enhanced metrics from real vehicle data with period consideration"""
@@ -262,7 +366,7 @@ def create_enhanced_metrics_from_real_data(vehicle_data, period_days=7):
     
     # Driving hours based on distance and realistic speeds
     avg_speed = 35 + (name_hash % 25)  # 35-60 km/h average
-    driving_hours = period_distance / avg_speed
+    driving_hours = period_distance / max(avg_speed, 1)  # Prevent division by zero
     
     # Engine hours (usually more than driving hours due to idling)
     engine_hours = driving_hours * 1.3
@@ -274,8 +378,9 @@ def create_enhanced_metrics_from_real_data(vehicle_data, period_days=7):
     current_speed = current.get('speed', 0)
     max_speed = max(current_speed, 60 + (name_hash % 40))
     
-    # Fuel calculations
-    fuel_consumption = period_distance * (0.25 + (name_hash % 10) / 100)  # 0.25-0.35 L/km
+    # Fuel calculations - ensure we don't get negative values
+    fuel_rate = 0.25 + (name_hash % 10) / 100  # 0.25-0.35 L/km
+    fuel_consumption = max(0, period_distance * fuel_rate)
     
     # Harsh events based on driving behavior
     harsh_acceleration = max(0, int((period_distance / 100) * (name_hash % 3)))
@@ -451,9 +556,15 @@ def generate_ptt_driver_template(processed_data, date_range, report_type):
         # Write data
         for col, value in enumerate(row_data):
             if isinstance(value, (int, float)) and col > 1:
-                worksheet.write(row, col, value, number_format)
+                # Ensure we write valid numbers
+                if value is None or (isinstance(value, float) and (value != value)):  # Check for NaN
+                    worksheet.write(row, col, 0, number_format)
+                else:
+                    worksheet.write(row, col, float(value), number_format)
             else:
-                worksheet.write(row, col, value, data_format)
+                # Convert to string and handle None values
+                str_value = str(value) if value is not None else ""
+                worksheet.write(row, col, str_value, data_format)
         
         row += 1
     
@@ -595,9 +706,15 @@ def generate_ptt_vehicle_template(processed_data, date_range, report_type):
         # Write data
         for col, value in enumerate(row_data):
             if isinstance(value, (int, float)) and col > 2:
-                worksheet.write(row, col, value, number_format)
+                # Ensure we write valid numbers
+                if value is None or (isinstance(value, float) and (value != value)):  # Check for NaN
+                    worksheet.write(row, col, 0, number_format)
+                else:
+                    worksheet.write(row, col, float(value), number_format)
             else:
-                worksheet.write(row, col, value, data_format)
+                # Convert to string and handle None values
+                str_value = str(value) if value is not None else ""
+                worksheet.write(row, col, str_value, data_format)
         
         row += 1
     
@@ -675,12 +792,22 @@ def main():
                         st.write(f"🟡 Active (1-7 days): {active}")
                         st.write(f"🟠 Somewhat Active (7-30 days): {somewhat_active}")
                         st.write(f"🔴 Inactive (>30 days): {inactive}")
+                    else:
+                        st.warning("⚠️ No vehicles found in your account. Please check your access permissions.")
+                        st.info("💡 Make sure your token has access to vehicle data and try again.")
                 else:
                     st.session_state.connected = False
         
         # Connection status
         if st.session_state.connected:
             st.markdown('<p class="status-connected">🟢 Connected</p>', unsafe_allow_html=True)
+            if st.button("🔌 Disconnect", type="secondary"):
+                st.session_state.wialon_service.logout()
+                st.session_state.connected = False
+                st.session_state.fleet_data = []
+                st.session_state.processed_data = []
+                st.success("✅ Disconnected successfully!")
+                st.rerun()
         else:
             st.markdown('<p class="status-disconnected">🔴 Disconnected</p>', unsafe_allow_html=True)
         
